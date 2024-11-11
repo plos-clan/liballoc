@@ -1,0 +1,21 @@
+[package]
+name = "liballoc"
+edition = "2021"
+
+[lib]
+name = "alloc"
+crate-type = ["staticlib"]
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 3
+strip = true
+codegen-units = 1
+
+[dependencies]
+spin = "0.9.8"
+talc = "4.4.2"
