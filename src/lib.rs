@@ -50,3 +50,14 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
     let origin_ptr = NonNull::new_unchecked(origin_ptr as *mut u8);
     ALLOCATOR.lock().free(origin_ptr, layout);
 }
+
+#[no_mangle]
+pub unsafe extern "C" fn get_allocator_size(ptr: *mut c_void) -> usize {
+    if ptr.is_null() {
+        return 0;
+    }
+    let user_ptr_as_usize = ptr as *mut usize;
+    let metadata_ptr = user_ptr_as_usize.sub(1);
+    let size = metadata_ptr.read();
+    size
+}
