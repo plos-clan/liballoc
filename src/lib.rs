@@ -3,11 +3,12 @@
 
 use core::alloc::Layout;
 use core::cmp;
+use core::cmp::Ordering;
 use core::ffi::c_void;
 use core::mem::{align_of, size_of};
+use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use talc::{ClaimOnOom, Span, Talc, Talck};
-use core::panic::PanicInfo;
 
 // Yes if panic just loops forever and you know died.
 #[panic_handler]
@@ -15,42 +16,112 @@ unsafe fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+/// Metadata struct stored *before* the user pointer's aligned position.
+/// We store the requested size and the alignment used for the user pointer.
+#[repr(C)] // Ensure predictable layout for size/alignment calculations
+#[derive(Debug, Clone, Copy)]
+struct Metadata {
+    /// The size requested by the user for the allocation.
+    size: usize,
+    /// The alignment requested by the user (or default for malloc).
+    alignment: usize,
+}
+
 // Use a spinlock mutex for thread safety in concurrent environments (if applicable)
-// or a simpler mutex/no mutex if targeting single-threaded `no_std`.
 static ALLOCATOR: Talck<spin::Mutex<()>, ClaimOnOom> =
     Talc::new(unsafe { ClaimOnOom::new(Span::empty()) }).lock();
 
-// We store the allocation size *just before* the pointer returned to the user.
-const METADATA_SIZE: usize = size_of::<usize>();
-// Use the alignment of the metadata itself for the layout calculations involving metadata.
-const METADATA_ALIGN: usize = align_of::<usize>();
+// Size and alignment of the metadata header itself.
+const METADATA_SIZE: usize = size_of::<Metadata>();
+const METADATA_ALIGN: usize = align_of::<Metadata>();
 
-/// Unsafely gets the pointer to the metadata (the stored size) from the user pointer.
+/// Calculates the layout required for the underlying allocation from `talc`.
+/// This layout must be large enough to hold the Metadata struct plus the requested
+/// user data size, potentially with padding in between to ensure the user data
+/// pointer meets its required alignment.
+///
+/// Returns:
+/// - `Ok((total_layout, user_data_offset))` where:
+///   - `total_layout`: The layout object to request from `talc`.
+///   - `user_data_offset`: The offset from the beginning of the `talc` allocation
+///     to where the correctly aligned user pointer should be.
+/// - `Err(())` if layout calculation overflows or results in an invalid layout.
 #[inline]
-unsafe fn get_metadata_ptr(ptr: NonNull<u8>) -> NonNull<usize> {
-    // User pointer points *after* the metadata.
-    let metadata_ptr = ptr.as_ptr().cast::<usize>().sub(1);
-    // Safety: Assumes the pointer was allocated by this allocator and has metadata prepended.
-    NonNull::new_unchecked(metadata_ptr)
+fn layout_for_allocation(
+    req_user_size: usize,
+    req_user_alignment: usize, // Alignment requested for the user pointer
+) -> Result<(Layout, usize), ()> {
+    // The alignment for the total block must satisfy both metadata and user alignment.
+    let total_block_align = cmp::max(req_user_alignment, METADATA_ALIGN);
+
+    // Calculate the offset for the user data pointer.
+    // The user pointer must start *after* the metadata AND satisfy `req_user_alignment`.
+    let user_data_offset = {
+        // Start calculating offset after metadata.
+        let offset_after_metadata = METADATA_SIZE;
+        // Align this offset up to the required user alignment.
+        // Formula: (value + align - 1) & !(align - 1) assuming align is power of 2.
+        offset_after_metadata
+            .checked_add(req_user_alignment - 1)
+            .ok_or(())?
+            & !(req_user_alignment - 1)
+    };
+
+    // Calculate the total size needed for the allocation block.
+    let total_block_size = user_data_offset.checked_add(req_user_size).ok_or(())?;
+
+    // Create the final layout for the allocator.
+    let total_layout =
+        Layout::from_size_align(total_block_size, total_block_align).map_err(|_| ())?;
+
+    Ok((total_layout, user_data_offset))
 }
 
-/// Unsafely gets the pointer to the start of the allocation (including metadata) from the user pointer.
+/// Gets the pointer to the Metadata struct from the user pointer.
+/// Assumes the user pointer is valid and was allocated by this allocator.
+/// The Metadata struct resides `METADATA_SIZE` bytes immediately *before*
+/// the address pointed to by `user_ptr`.
+///
+/// # Safety
+/// `user_ptr` must point to the start of the user data area of a valid allocation
+/// managed by this allocator. The memory layout must be as expected (Metadata immediately preceding).
 #[inline]
-unsafe fn get_allocation_start_ptr(ptr: NonNull<u8>) -> NonNull<u8> {
-    // User pointer points *after* the metadata.
-    let alloc_start_ptr = ptr.as_ptr().sub(METADATA_SIZE);
-    // Safety: Assumes the pointer was allocated by this allocator and has metadata prepended.
-    NonNull::new_unchecked(alloc_start_ptr)
+unsafe fn get_metadata_ptr_from_user_ptr(user_ptr: NonNull<u8>) -> NonNull<Metadata> {
+    // Calculate the address directly before the user pointer.
+    let metadata_byte_ptr = user_ptr.as_ptr().sub(METADATA_SIZE);
+    // Safety: Caller guarantees user_ptr points METADATA_SIZE bytes *after*
+    // the start of a valid Metadata struct instance within the same allocated block.
+    NonNull::new_unchecked(metadata_byte_ptr.cast::<Metadata>())
 }
 
-/// Creates the layout for an allocation, including space for metadata.
-/// The alignment must accommodate both the requested alignment and the metadata alignment.
+/// Recovers the original allocation pointer (as returned by `talc`) and the
+/// `Layout` object used for that original allocation, based on the user pointer.
+///
+/// # Safety
+/// `user_ptr` must be a non-null pointer returned by `malloc`, `aligned_alloc`, or `realloc`
+/// from this allocator. The metadata preceding it must be intact.
 #[inline]
-fn create_layout_with_metadata(size: usize, alignment: usize) -> Result<Layout, ()> {
-    let layout_align = cmp::max(alignment, METADATA_ALIGN);
-    // Check for overflow before calling Layout::from_size_align
-    let layout_size = size.checked_add(METADATA_SIZE).ok_or(())?;
-    Layout::from_size_align(layout_size, layout_align).map_err(|_| ())
+unsafe fn recover_alloc_ptr_and_layout(user_ptr: NonNull<u8>) -> Result<(NonNull<u8>, Layout), ()> {
+    // 1. Get pointer to metadata and read it to find original size and alignment.
+    let metadata_ptr = get_metadata_ptr_from_user_ptr(user_ptr);
+    // Safety: Pointer is assumed valid by caller.
+    let metadata = metadata_ptr.as_ptr().read();
+
+    // 2. Recalculate the layout and user_data_offset used for the original allocation.
+    //    Use the size and alignment stored *in the metadata*.
+    let (original_total_layout, user_data_offset) =
+        layout_for_allocation(metadata.size, metadata.alignment)?;
+
+    // 3. Calculate the original allocation start pointer address.
+    //    user_ptr = alloc_ptr + user_data_offset
+    //    alloc_ptr = user_ptr - user_data_offset
+    let alloc_start_ptr_addr = user_ptr.as_ptr().wrapping_sub(user_data_offset);
+
+    // Safety: We assume the subtraction is valid and yields the original non-null pointer
+    //         returned by talc.
+    let alloc_start_ptr = NonNull::new_unchecked(alloc_start_ptr_addr);
+
+    Ok((alloc_start_ptr, original_total_layout))
 }
 
 // == C API Implementation ==
@@ -61,18 +132,66 @@ fn create_layout_with_metadata(size: usize, alignment: usize) -> Result<Layout, 
 /// - `address` must be a valid pointer to the start of a memory block.
 /// - `size` must be the correct size of that memory block.
 /// - This function should only be called once.
+/// - The memory block should ideally be aligned to at least `align_of::<Metadata>()`.
 #[no_mangle]
 pub unsafe extern "C" fn heap_init(address: *mut u8, size: usize) -> bool {
-    // Ensure the address is not null before creating the span.
+    // Ensure the address is not null.
     if address.is_null() {
         return false;
     }
+    // Basic check: Ensure size is somewhat reasonable. Talc itself has minimal overhead.
+    // We need enough space for at least one metadata block and minimal user data.
+    if size < METADATA_SIZE * 2 {
+        // Arbitrary minimal check
+        return false; // Arena too small.
+    }
+
+    // Give the memory span to the allocator.
     let arena = Span::from_base_size(address, size);
     ALLOCATOR.lock().claim(arena).is_ok()
 }
 
-/// Allocates memory with default alignment.
-/// Stores the requested size before the returned pointer.
+/// Internal allocation function implementing the core logic for `malloc` and `aligned_alloc`.
+/// Handles layout calculation, allocation via `talc`, metadata writing, and returns the aligned user pointer.
+///
+/// # Safety
+/// `alignment` must be a power of two.
+/// `size` should be non-zero for `aligned_alloc`, `malloc` handles size 0 separately.
+#[inline]
+unsafe fn allocate_internal(size: usize, alignment: usize) -> *mut c_void {
+    // Calculate the layout required for the talc allocation and the offset to the user pointer.
+    let (total_layout, user_data_offset) = match layout_for_allocation(size, alignment) {
+        Ok(l) => l,
+        Err(_) => return ptr::null_mut(), // Layout calculation failed (e.g., overflow, invalid size/align)
+    };
+
+    // Allocate the memory block using the calculated total layout.
+    match ALLOCATOR.lock().malloc(total_layout) {
+        Ok(alloc_ptr) => {
+            // `alloc_ptr` points to the start of the talc allocation block.
+            // Calculate the user pointer address based on the start and the offset.
+            // Safety: alloc_ptr is valid and non-null, user_data_offset calculated correctly.
+            let user_ptr_addr = alloc_ptr.as_ptr().add(user_data_offset);
+
+            // Calculate the metadata pointer address (immediately before user_ptr).
+            // Safety: user_ptr_addr is valid, and layout_for_allocation ensures
+            // user_data_offset >= METADATA_SIZE.
+            let metadata_ptr_addr = user_ptr_addr.sub(METADATA_SIZE);
+            let metadata_ptr = metadata_ptr_addr.cast::<Metadata>();
+
+            // Write the metadata (original requested size and alignment).
+            // Safety: metadata_ptr points to valid, allocated space of METADATA_SIZE within the block.
+            metadata_ptr.write(Metadata { size, alignment });
+
+            // Return the user pointer (correctly aligned).
+            user_ptr_addr as *mut c_void
+        }
+        Err(_) => ptr::null_mut(), // Allocation failed (OOM)
+    }
+}
+
+/// Allocates memory with default alignment (`align_of::<usize>`).
+/// Stores metadata (size, alignment) before the returned pointer.
 ///
 /// # Safety
 /// Caller is responsible for handling the returned pointer (e.g., checking for null)
@@ -81,131 +200,220 @@ pub unsafe extern "C" fn heap_init(address: *mut u8, size: usize) -> bool {
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
     if size == 0 {
         // Standard C malloc behavior for size 0 is implementation-defined.
-        // Returning null is a common choice.
+        // Returning null is common and simple. Some implementations return a unique pointer
+        // that can be passed to free. Returning null avoids allocating for zero size.
+        return ptr::null_mut();
+    }
+    // Use the natural alignment of usize as the default alignment for malloc.
+    let default_alignment = align_of::<usize>();
+    allocate_internal(size, default_alignment)
+}
+
+/// Allocates memory with specified alignment.
+/// Stores metadata (size, alignment) before the returned pointer.
+///
+/// # Safety
+/// Caller is responsible for handling the returned pointer and eventually freeing it.
+/// `alignment` must be a power of two.
+/// `size` must be non-zero (as per C standard `aligned_alloc`).
+/// Behavior is undefined if `size` is not a multiple of `alignment` (C standard requirement).
+#[no_mangle]
+pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
+    // Check alignment validity (must be power of two).
+    // `layout_for_allocation` relies on this for correct alignment calculation.
+    if !alignment.is_power_of_two() {
+        // Consider setting errno to EINVAL if integrating deeply with C stdlib.
         return ptr::null_mut();
     }
 
-    // Request layout with space for metadata, using default alignment (usize).
-    let layout = match create_layout_with_metadata(size, METADATA_ALIGN) {
-        Ok(l) => l,
-        Err(_) => return ptr::null_mut(), // Layout calculation failed
-    };
-
-    match ALLOCATOR.lock().malloc(layout) {
-        Ok(alloc_ptr) => {
-            // Pointer returned by allocator is the start of the whole block (metadata + data).
-            // Store the *requested* size in the metadata slot.
-            let metadata_ptr = alloc_ptr.as_ptr().cast::<usize>();
-            // Safety: alloc_ptr is valid and points to sufficient space.
-            metadata_ptr.write(size);
-
-            // Return the pointer *after* the metadata.
-            let user_ptr = alloc_ptr.as_ptr().add(METADATA_SIZE);
-            user_ptr as *mut c_void
-        }
-        Err(_) => ptr::null_mut(), // Allocation failed (OOM)
+    // Check size validity (non-zero, multiple of alignment - C standard requirement).
+    if size == 0 || size % alignment != 0 {
+        // Consider setting errno to EINVAL.
+        return ptr::null_mut();
     }
+
+    // Delegate to the internal allocation function.
+    allocate_internal(size, alignment)
 }
 
 /// Frees memory previously allocated by `malloc`, `realloc`, or `aligned_alloc`.
 ///
 /// # Safety
-/// - `ptr` must be null or a pointer previously returned by `malloc`, `realloc`, or `aligned_alloc`.
+/// - `ptr` must be null or a pointer previously returned by `malloc`, `realloc`, or `aligned_alloc`
+///   from *this* allocator instance.
 /// - Calling `free` multiple times on the same non-null pointer leads to double-free (UB).
 /// - Using the pointer after `free` leads to use-after-free (UB).
 #[no_mangle]
 pub unsafe extern "C" fn free(ptr: *mut c_void) {
-    // `free(null)` is a no-op.
+    // `free(null)` is defined as a no-op.
     let Some(user_ptr) = NonNull::new(ptr.cast::<u8>()) else {
         return;
     };
 
-    // Retrieve the stored size and calculate the original allocation pointer and layout.
-    // Safety: Assumes `ptr` came from this allocator's functions.
-    let metadata_ptr = get_metadata_ptr(user_ptr);
-    let size = metadata_ptr.as_ptr().read();
-
-    let alloc_start_ptr = get_allocation_start_ptr(user_ptr);
-
-    // Reconstruct the layout used for the original allocation.
-    let layout = match create_layout_with_metadata(size, METADATA_ALIGN) {
-        Ok(l) => l,
+    // Recover the original allocation pointer and layout using the metadata stored before user_ptr.
+    match recover_alloc_ptr_and_layout(user_ptr) {
+        Ok((alloc_start_ptr, original_total_layout)) => {
+            // Safety: `alloc_start_ptr` and `original_total_layout` must correspond to a previous
+            // allocation made by this allocator via `allocate_internal` or `realloc`.
+            // `recover_alloc_ptr_and_layout` guarantees this if `user_ptr` was valid.
+            ALLOCATOR
+                .lock()
+                .free(alloc_start_ptr, original_total_layout);
+        }
         Err(_) => {
-            // This should not happen if allocation succeeded, but handle defensively.
-            // Perhaps log an error in a real scenario.
+            // Indicates an internal logic error (layout recovery failed) or memory corruption
+            // (metadata damaged or ptr wasn't from this allocator).
+            // In a real system, log an error or trigger an assertion. Avoid crashing.
+            // Leaking memory might be the safest option here if corruption is suspected.
             return;
         }
-    };
-
-    // Safety: alloc_start_ptr and layout must correspond to a previous allocation.
-    ALLOCATOR.lock().free(alloc_start_ptr, layout);
+    }
 }
 
 /// Reallocates memory previously allocated by `malloc`, `realloc`, or `aligned_alloc`.
-/// Attempts to use `talc`'s underlying realloc for efficiency.
+/// Attempts to use `talc`'s underlying realloc for efficiency, preserving the original alignment.
 ///
 /// # Safety
 /// - `ptr` must be null or a pointer previously returned by `malloc`, `realloc`, or `aligned_alloc`.
 /// - `new_size` is the desired size for the new allocation.
 /// - If reallocation fails, the original pointer `ptr` remains valid and must still be freed.
-/// - If reallocation succeeds, the original `ptr` is invalidated.
+/// - If reallocation succeeds, the original `ptr` is invalidated and the new pointer should be used.
 #[no_mangle]
 pub unsafe extern "C" fn realloc(ptr: *mut c_void, new_size: usize) -> *mut c_void {
-    // Handle null pointer: equivalent to malloc(new_size).
+    // Handle null pointer: standard requires this is equivalent to malloc(new_size).
     let Some(user_ptr_non_null) = NonNull::new(ptr.cast::<u8>()) else {
-        return malloc(new_size);
+        // Use default alignment consistent with malloc.
+        let default_alignment = align_of::<usize>();
+        return allocate_internal(new_size, default_alignment);
     };
-    let user_ptr = user_ptr_non_null.as_ptr(); // Back to *mut u8 for pointer math/copying
 
-    // Handle new_size == 0: equivalent to free(ptr).
+    // Handle new_size == 0: standard requires this is equivalent to free(ptr) and returns null.
     if new_size == 0 {
         free(ptr);
         return ptr::null_mut();
     }
 
-    // Retrieve old size from metadata.
-    // Safety: Assumes `ptr` came from this allocator's functions.
-    let old_size = get_metadata_ptr(user_ptr_non_null).as_ptr().read();
+    // --- Attempt Optimized Realloc ---
 
-    // If size hasn't changed, do nothing (as per C standard).
-    if new_size == old_size {
-        return ptr;
+    // 1. Recover original allocation info (pointer returned by talc and its layout).
+    let (old_alloc_ptr, old_total_layout) = match recover_alloc_ptr_and_layout(user_ptr_non_null) {
+        Ok(res) => res,
+        Err(_) => return ptr::null_mut(), // Cannot recover layout - indicates corruption or invalid ptr.
+    };
+
+    // 2. Read old metadata *again* to get the original alignment and user size.
+    // Safety: Assumes ptr is valid and metadata readable.
+    let old_metadata = get_metadata_ptr_from_user_ptr(user_ptr_non_null)
+        .as_ptr()
+        .read();
+    let original_alignment = old_metadata.alignment;
+    let old_user_size = old_metadata.size;
+
+    // 3. Compare sizes and choose strategy.
+    match new_size.cmp(&old_user_size) {
+        Ordering::Equal => {
+            // Sizes are the same, no operation needed.
+            ptr
+        }
+
+        Ordering::Greater => {
+            // Calculate the required new total layout based on new user size and original alignment.
+            let (new_total_layout, _) = match layout_for_allocation(new_size, original_alignment) {
+                Ok(l) => l,
+                Err(_) => return ptr::null_mut(), // New layout calculation failed.
+            };
+
+            // Attempt to grow in-place first.
+            // We need to lock the allocator.
+            let mut allocator_lock = ALLOCATOR.lock();
+
+            // Safety: `old_alloc_ptr` and `old_total_layout` are valid.
+            match allocator_lock.grow_in_place(
+                old_alloc_ptr,
+                old_total_layout,
+                new_total_layout.size(),
+            ) {
+                Ok(_returned_ptr) => {
+                    // Successfully grew in place! _returned_ptr should == old_alloc_ptr
+                    // The memory block is larger, but user pointer hasn't moved.
+                    // We MUST update the metadata *in place*.
+                    drop(allocator_lock); // Release lock before writing metadata
+
+                    let metadata_ptr = get_metadata_ptr_from_user_ptr(user_ptr_non_null);
+                    // Safety: metadata_ptr is valid as pointer hasn't moved.
+                    metadata_ptr.as_ptr().write(Metadata {
+                        size: new_size,
+                        alignment: original_alignment,
+                    });
+
+                    // Return the original user pointer.
+                    ptr
+                }
+                Err(_) => {
+                    // grow_in_place failed, fall back to malloc-copy-free.
+                    // Release the lock as allocate_internal will acquire it.
+                    drop(allocator_lock);
+
+                    // Allocate a completely new block.
+                    let new_ptr_void = allocate_internal(new_size, original_alignment);
+                    if new_ptr_void.is_null() {
+                        // Allocation failed, original pointer `ptr` is still valid.
+                        return ptr::null_mut();
+                    }
+                    let new_user_ptr = new_ptr_void.cast::<u8>();
+
+                    // Copy data from the old user pointer area to the new user pointer area.
+                    let copy_size = old_user_size; // When growing, copy the original size.
+                                                   // Safety: `ptr` and `new_user_ptr` are valid, non-overlapping.
+                    ptr::copy_nonoverlapping(user_ptr_non_null.as_ptr(), new_user_ptr, copy_size);
+
+                    // Free the *original* allocation block (using recovered ptr and layout).
+                    // `free` will handle locking internally.
+                    // NOTE: We use the original `ptr` here, which free can handle.
+                    free(ptr);
+
+                    // Return the pointer to the newly allocated and populated block.
+                    new_ptr_void
+                }
+            }
+        }
+
+        Ordering::Less => {
+            // --- Shrink ---
+            // Calculate the new total layout for the smaller size.
+            let (new_total_layout, _new_user_data_offset) =
+                match layout_for_allocation(new_size, original_alignment) {
+                    Ok(l) => l,
+                    Err(_) => return ptr::null_mut(), // Should not fail for smaller size if old layout was valid.
+                };
+            let new_total_size = new_total_layout.size();
+
+            // Attempt to shrink in place.
+            let mut allocator_lock = ALLOCATOR.lock();
+
+            // Safety: `old_alloc_ptr` and `old_total_layout` are valid.
+            allocator_lock.shrink(old_alloc_ptr, old_total_layout, new_total_size);
+            drop(allocator_lock); // Release lock
+
+            let metadata_ptr = get_metadata_ptr_from_user_ptr(user_ptr_non_null);
+            // Safety: metadata_ptr is valid.
+            metadata_ptr.as_ptr().write(Metadata {
+                size: new_size,
+                alignment: original_alignment,
+            });
+            ptr // Return original pointer
+        }
     }
-
-    // Allocate new block
-    let new_ptr = malloc(new_size);
-    if new_ptr.is_null() {
-        // Allocation failed, original pointer is still valid.
-        return ptr::null_mut();
-    }
-
-    // Copy data from old block to new block.
-    let copy_size = cmp::min(old_size, new_size);
-    // Safety: `ptr` and `new_ptr` are valid for reads/writes of `copy_size` bytes respectively,
-    // and `malloc` guarantees they don't overlap if `new_ptr` is non-null.
-    ptr::copy_nonoverlapping(user_ptr, new_ptr.cast::<u8>(), copy_size);
-
-    // Free the old block.
-    // Safety: `ptr` is valid and was allocated by this allocator.
-    free(ptr);
-
-    // Return the new block.
-    new_ptr
 }
 
 /// Returns the usable size of the memory block pointed to by `ptr`.
-///
-/// In this specific implementation, this corresponds to the size originally requested
-/// during the allocation (`malloc`, `aligned_alloc`, `realloc`). It does *not*
-/// necessarily reflect the true size of the underlying block allocated by `talc`,
-/// which might be larger due to internal padding or alignment.
-///
+/// This corresponds to the size originally requested during allocation (`malloc`, `aligned_alloc`, `realloc`).
 /// Returns 0 if `ptr` is null.
 ///
 /// # Safety
 /// - `ptr` must be null or a pointer previously returned by `malloc`, `realloc`,
 ///   or `aligned_alloc` from this specific allocator instance and implementation.
-///   Passing any other pointer (including pointers offset from the original)
+///   Passing any other pointer (including pointers offset from the original user pointer)
 ///   leads to Undefined Behavior.
 /// - The behavior is undefined if the metadata preceding `ptr` has been corrupted.
 #[no_mangle]
@@ -216,53 +424,11 @@ pub unsafe extern "C" fn usable_size(ptr: *mut c_void) -> usize {
     };
 
     // Retrieve the stored size from the metadata located just before the user pointer.
-    // Safety: Assumes `ptr` is valid and points *after* our metadata header.
-    // Relies on the metadata structure defined in `malloc`, `realloc`, `aligned_alloc`.
-    get_metadata_ptr(user_ptr).as_ptr().read()
-}
+    // Safety: Assumes `ptr` is valid and points *after* our metadata header as designed.
+    let metadata_ptr = get_metadata_ptr_from_user_ptr(user_ptr);
+    // Safety: Pointer is assumed valid by caller, points to readable Metadata.
+    let metadata = metadata_ptr.as_ptr().read();
 
-
-/// Allocates memory with specified alignment.
-/// Stores metadata similarly to `malloc`.
-///
-/// NOTE: While this allocates with the requested alignment *for the block given to talc*,
-/// the returned user pointer (offset by METADATA_SIZE) might not meet the requested
-/// alignment if `alignment > align_of::<usize>()`.
-///
-/// # Safety
-/// Caller is responsible for handling the returned pointer and eventually freeing it.
-/// `alignment` must be a power of two.
-/// `size` must be a multiple of `alignment` (as per C standard).
-#[no_mangle]
-pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_void {
-    // Check alignment validity (power of two)
-    if alignment == 0 || alignment & (alignment - 1) != 0 {
-        return ptr::null_mut();
-    }
-
-    // Check size validity (multiple of alignment, non-zero)
-    if size == 0 || size % alignment != 0 {
-        return ptr::null_mut();
-    }
-
-    // Request layout with space for metadata, using the specified alignment.
-    let layout = match create_layout_with_metadata(size, alignment) {
-        Ok(l) => l,
-        Err(_) => return ptr::null_mut(), // Layout calculation failed
-    };
-
-    match ALLOCATOR.lock().malloc(layout) {
-        Ok(alloc_ptr) => {
-            // Store the *requested* size in the metadata slot.
-            let metadata_ptr = alloc_ptr.as_ptr().cast::<usize>();
-            // Safety: alloc_ptr is valid and points to sufficient space.
-            metadata_ptr.write(size);
-
-            // Return the pointer *after* the metadata.
-            // WARNING: This might not be `alignment`-aligned if `alignment > METADATA_ALIGN`.
-            let user_ptr = alloc_ptr.as_ptr().add(METADATA_SIZE);
-            user_ptr as *mut c_void
-        }
-        Err(_) => ptr::null_mut(), // Allocation failed (OOM)
-    }
+    // Return the user-requested size stored in the metadata.
+    metadata.size
 }
