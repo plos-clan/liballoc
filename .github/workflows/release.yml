@@ -39,6 +39,12 @@ jobs:
         mv target/x86_64-unknown-none/release/liballoc.a liballoc-x86_64.a
         mv target/i686-unknown-none/release/liballoc.a liballoc-i686.a
 
+    - name: Build strict release
+      run: |
+        cargo build --release --features panic_invalid_free
+        mv target/x86_64-unknown-none/release/liballoc.a liballoc-x86_64-strict.a
+        mv target/i686-unknown-none/release/liballoc.a liballoc-i686-strict.a
+
     - name: Generate header
       run: cbindgen --output alloc.h
 
@@ -50,4 +56,6 @@ jobs:
         files: |
           liballoc-i686.a
           liballoc-x86_64.a
+          liballoc-i686-strict.a
+          liballoc-x86_64-strict.a
           alloc.h

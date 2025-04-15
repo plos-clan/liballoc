@@ -48,27 +48,22 @@ const METADATA_ALIGN: usize = align_of::<Metadata>();
 /// - `Err(())` if layout calculation overflows or results in an invalid layout.
 #[inline]
 fn layout_for_allocation(
-    req_user_size: usize,
-    req_user_alignment: usize, // Alignment requested for the user pointer
+    size: usize,
+    alignment: usize, // Alignment requested for the user pointer
 ) -> Result<(Layout, usize), ()> {
     // The alignment for the total block must satisfy both metadata and user alignment.
-    let total_align = cmp::max(req_user_alignment, METADATA_ALIGN);
+    let total_align = cmp::max(alignment, METADATA_ALIGN);
 
     // Calculate the offset for the user data pointer.
-    // The user pointer must start *after* the metadata AND satisfy `req_user_alignment`.
+    // The user pointer must start *after* the metadata AND satisfy `alignment`.
     let user_data_offset = {
-        // Start calculating offset after metadata.
-        let offset_after_metadata = METADATA_SIZE;
         // Align this offset up to the required user alignment.
         // Formula: (value + align - 1) & !(align - 1) assuming align is power of 2.
-        offset_after_metadata
-            .checked_add(req_user_alignment - 1)
-            .ok_or(())?
-            & !(req_user_alignment - 1)
+        METADATA_SIZE.checked_add(alignment - 1).ok_or(())? & !(alignment - 1)
     };
 
     // Calculate the total size needed for the allocation block.
-    let total_size = user_data_offset.checked_add(req_user_size).ok_or(())?;
+    let total_size = user_data_offset.checked_add(size).ok_or(())?;
 
     // Create the final layout for the allocator.
     let total_layout = Layout::from_size_align(total_size, total_align).map_err(|_| ())?;
@@ -288,6 +283,8 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
             // (metadata damaged or ptr wasn't from this allocator).
             // In a real system, log an error or trigger an assertion. Avoid crashing.
             // Leaking memory might be the safest option here if corruption is suspected.
+            #[cfg(feature = "panic_invalid_free")]
+            panic!("Memory corruption detected or invalid pointer passed to free.");
         }
     }
 }
@@ -317,7 +314,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
     // --- Attempt Optimized Realloc ---
 
     // 1. Recover original allocation info (pointer returned by talc and its layout).
-    let (old_alloc_ptr, old_total_layout) = match recover_alloc_info(user_ptr) {
+    let (old_ptr, old_layout) = match recover_alloc_info(user_ptr) {
         Ok(res) => res,
         Err(_) => return ptr::null_mut(), // Cannot recover layout - indicates corruption or invalid ptr.
     };
@@ -334,6 +331,31 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
             ptr
         }
 
+        Ordering::Less => {
+            // --- Shrink ---
+            // Calculate the new total layout for the smaller size.
+            let (new_total_layout, _new_user_data_offset) =
+                match layout_for_allocation(size, alignment) {
+                    Ok(l) => l,
+                    Err(_) => return ptr::null_mut(), // Should not fail for smaller size if old layout was valid.
+                };
+            let new_total_size = new_total_layout.size();
+
+            // Attempt to shrink in place.
+            let mut allocator_lock = ALLOCATOR.lock();
+
+            // Safety: `old_ptr` and `old_layout` are valid.
+            allocator_lock.shrink(old_ptr, old_layout, new_total_size);
+            drop(allocator_lock); // Release lock
+
+            let metadata_ptr = get_metadata_ptr(user_ptr);
+            // Safety: metadata_ptr is valid.
+            metadata_ptr.as_ptr().write(Metadata { size, alignment });
+
+            // Return original pointer
+            ptr
+        }
+
         Ordering::Greater => {
             // Calculate the required new total layout based on new user size and original alignment.
             let (new_total_layout, _) = match layout_for_allocation(size, alignment) {
@@ -345,14 +367,10 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
             // We need to lock the allocator.
             let mut allocator_lock = ALLOCATOR.lock();
 
-            // Safety: `old_alloc_ptr` and `old_total_layout` are valid.
-            match allocator_lock.grow_in_place(
-                old_alloc_ptr,
-                old_total_layout,
-                new_total_layout.size(),
-            ) {
+            // Safety: `old_ptr` and `old_layout` are valid.
+            match allocator_lock.grow_in_place(old_ptr, old_layout, new_total_layout.size()) {
                 Ok(_returned_ptr) => {
-                    // Successfully grew in place! _returned_ptr should == old_alloc_ptr
+                    // Successfully grew in place! _returned_ptr should == old_ptr
                     // The memory block is larger, but user pointer hasn't moved.
                     // We MUST update the metadata *in place*.
                     drop(allocator_lock); // Release lock before writing metadata
@@ -393,31 +411,6 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
                     new_ptr_void
                 }
             }
-        }
-
-        Ordering::Less => {
-            // --- Shrink ---
-            // Calculate the new total layout for the smaller size.
-            let (new_total_layout, _new_user_data_offset) =
-                match layout_for_allocation(size, alignment) {
-                    Ok(l) => l,
-                    Err(_) => return ptr::null_mut(), // Should not fail for smaller size if old layout was valid.
-                };
-            let new_total_size = new_total_layout.size();
-
-            // Attempt to shrink in place.
-            let mut allocator_lock = ALLOCATOR.lock();
-
-            // Safety: `old_alloc_ptr` and `old_total_layout` are valid.
-            allocator_lock.shrink(old_alloc_ptr, old_total_layout, new_total_size);
-            drop(allocator_lock); // Release lock
-
-            let metadata_ptr = get_metadata_ptr(user_ptr);
-            // Safety: metadata_ptr is valid.
-            metadata_ptr.as_ptr().write(Metadata { size, alignment });
-
-            // Return original pointer
-            ptr
         }
     }
 }
