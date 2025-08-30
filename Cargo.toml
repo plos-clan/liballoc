@@ -18,7 +18,4 @@ codegen-units = 1
 
 [dependencies]
 spin = "0.10.0"
-talc = "4.4.2"
-
-[features]
-panic_invalid_free = []
+talc = "4.4.3"

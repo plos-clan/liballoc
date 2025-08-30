@@ -3,11 +3,11 @@
 
 use core::alloc::Layout;
 use core::cmp;
-use core::cmp::Ordering;
 use core::ffi::c_void;
 use core::mem::{align_of, size_of};
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
+use core::sync::atomic::{AtomicPtr, Ordering};
 use talc::{ClaimOnOom, Span, Talc, Talck};
 
 // Yes if panic just loops forever and you know died.
@@ -16,11 +16,31 @@ unsafe fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
 
+// Define a type for our error handling function pointer.
+// It will receive an enum indicating the error type and the invalid pointer.
+#[repr(C)]
+pub enum HeapError {
+    InvalidFree, // Covers double free, invalid pointer, corrupted metadata
+    LayoutError, // Internal layout calculation failed
+}
+
+/// Type alias for the error handler function pointer.
+pub type ErrorHandler = unsafe extern "C" fn(error: HeapError, ptr: *mut c_void);
+
+// A static variable to hold the user-provided error handler.
+// Use AtomicPtr for safe, lock-free access (even if we only set it once).
+static ERROR_HANDLER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
+
+// A constant canary value to verify metadata integrity.
+const CANARY_VALUE: usize = 0xDEC0DED;
+
 /// Metadata struct stored *before* the user pointer's aligned position.
 /// We store the requested size and the alignment used for the user pointer.
 #[repr(C)] // Ensure predictable layout for size/alignment calculations
 #[derive(Debug, Clone, Copy)]
 struct Metadata {
+    /// A canary value to help detect memory corruption.
+    canary: usize,
     /// The size requested by the user for the allocation.
     size: usize,
     /// The alignment requested by the user (or default for malloc).
@@ -71,6 +91,22 @@ fn layout_for_allocation(
     Ok((total_layout, user_data_offset))
 }
 
+/// Reports an error via the user-provided error handler, if set.
+/// If no handler is set, this function does nothing.
+///
+/// # Safety
+/// The caller must ensure that the error handler, if set, is a valid function
+/// pointer and can be safely called with the provided arguments.
+/// This function is unsafe because it involves calling a raw function pointer.
+#[inline]
+unsafe fn report_error(error: HeapError, ptr: *mut c_void) {
+    let handler_ptr = ERROR_HANDLER.load(Ordering::Relaxed);
+    if !handler_ptr.is_null() {
+        let handler: ErrorHandler = core::mem::transmute(handler_ptr);
+        handler(error, ptr);
+    }
+}
+
 /// Gets the pointer to the Metadata struct from the user pointer.
 /// Assumes the user pointer is valid and was allocated by this allocator.
 /// The Metadata struct resides `METADATA_SIZE` bytes immediately *before*
@@ -80,12 +116,17 @@ fn layout_for_allocation(
 /// `user_ptr` must point to the start of the user data area of a valid allocation
 /// managed by this allocator. The memory layout must be as expected (Metadata immediately preceding).
 #[inline]
-unsafe fn get_metadata_ptr(user_ptr: NonNull<u8>) -> NonNull<Metadata> {
+unsafe fn get_metadata_ptr(user_ptr: NonNull<u8>) -> Result<NonNull<Metadata>, ()> {
     // Calculate the address directly before the user pointer.
     let metadata_ptr = user_ptr.as_ptr().sub(METADATA_SIZE);
-    // Safety: Caller guarantees user_ptr points METADATA_SIZE bytes *after*
-    // the start of a valid Metadata struct instance within the same allocated block.
-    NonNull::new_unchecked(metadata_ptr.cast::<Metadata>())
+    let metadata = &*(metadata_ptr.cast::<Metadata>());
+
+    // Check the canary to verify integrity.
+    if metadata.canary != CANARY_VALUE {
+        Err(())
+    } else {
+        Ok(NonNull::new_unchecked(metadata_ptr.cast::<Metadata>()))
+    }
 }
 
 /// Recovers the original allocation pointer (as returned by `talc`) and the
@@ -95,9 +136,9 @@ unsafe fn get_metadata_ptr(user_ptr: NonNull<u8>) -> NonNull<Metadata> {
 /// `user_ptr` must be a non-null pointer returned by `malloc`, `aligned_alloc`, or `realloc`
 /// from this allocator. The metadata preceding it must be intact.
 #[inline]
-unsafe fn recover_alloc_info(user_ptr: NonNull<u8>) -> Result<(NonNull<u8>, Layout), ()> {
+unsafe fn recover_alloc_info(user_ptr: NonNull<u8>) -> Result<(NonNull<u8>, Layout, Metadata), ()> {
     // 1. Get pointer to metadata and read it to find original size and alignment.
-    let metadata_ptr = get_metadata_ptr(user_ptr);
+    let metadata_ptr = get_metadata_ptr(user_ptr)?;
     // Safety: Pointer is assumed valid by caller.
     let metadata = metadata_ptr.as_ptr().read();
 
@@ -110,12 +151,9 @@ unsafe fn recover_alloc_info(user_ptr: NonNull<u8>) -> Result<(NonNull<u8>, Layo
     //    user_ptr = alloc_ptr + user_data_offset
     //    alloc_ptr = user_ptr - user_data_offset
     let start_ptr_addr = user_ptr.as_ptr().wrapping_sub(user_data_offset);
-
-    // Safety: We assume the subtraction is valid and yields the original non-null pointer
-    //         returned by talc.
     let start_ptr = NonNull::new_unchecked(start_ptr_addr);
 
-    Ok((start_ptr, original_layout))
+    Ok((start_ptr, original_layout, metadata))
 }
 
 // == C API Implementation ==
@@ -145,6 +183,20 @@ pub unsafe extern "C" fn heap_init(address: *mut u8, size: usize) -> bool {
     ALLOCATOR.lock().claim(arena).is_ok()
 }
 
+/// Sets a custom error handler function to be called on heap errors.
+/// Passing `None` clears any previously set handler.
+///
+/// # Safety
+/// - The `handler` function pointer must be valid and callable.
+#[no_mangle]
+pub unsafe extern "C" fn heap_onerror(handler: Option<ErrorHandler>) {
+    let ptr = match handler {
+        Some(h) => h as *mut c_void,
+        None => ptr::null_mut(),
+    };
+    ERROR_HANDLER.store(ptr, Ordering::SeqCst);
+}
+
 /// Returns the usable size of the memory block pointed to by `ptr`.
 /// This corresponds to the size originally requested during allocation (`malloc`, `aligned_alloc`, `realloc`).
 /// Returns 0 if `ptr` is null.
@@ -162,14 +214,14 @@ pub unsafe extern "C" fn usable_size(ptr: *mut c_void) -> usize {
         return 0;
     };
 
-    // Retrieve the stored size from the metadata located just before the user pointer.
-    // Safety: Assumes `ptr` is valid and points *after* our metadata header as designed.
-    let metadata_ptr = get_metadata_ptr(user_ptr);
-    // Safety: Pointer is assumed valid by caller, points to readable Metadata.
-    let metadata = metadata_ptr.as_ptr().read();
-
-    // Return the user-requested size stored in the metadata.
-    metadata.size
+    // Check and retrieve the metadata.
+    match get_metadata_ptr(user_ptr) {
+        Ok(metadata_ptr) => metadata_ptr.as_ref().size,
+        Err(_) => {
+            report_error(HeapError::InvalidFree, ptr);
+            0
+        }
+    }
 }
 
 /// Internal allocation function implementing the core logic for `malloc` and `aligned_alloc`.
@@ -202,7 +254,11 @@ unsafe fn allocate_internal(size: usize, alignment: usize) -> *mut c_void {
 
             // Write the metadata (original requested size and alignment).
             // Safety: metadata_ptr points to valid, allocated space of METADATA_SIZE within the block.
-            metadata_ptr.write(Metadata { size, alignment });
+            metadata_ptr.write(Metadata {
+                canary: CANARY_VALUE,
+                size,
+                alignment,
+            });
 
             // Return the user pointer (correctly aligned).
             user_ptr as *mut c_void
@@ -272,19 +328,22 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
 
     // Recover the original allocation pointer and layout using the metadata stored before user_ptr.
     match recover_alloc_info(user_ptr) {
-        Ok((start_ptr, original_layout)) => {
+        Ok((start_ptr, original_layout, _)) => {
+            // Before freeing, corrupt the canary to help catch use-after-free
+            // if the user tries to free it again.
+            if let Ok(metadata_ptr) = get_metadata_ptr(user_ptr) {
+                (*metadata_ptr.as_ptr()).canary = 0; // Set to a non-canary value
+            }
+
             // Safety: `start_ptr` and `original_layout` must correspond to a previous
             // allocation made by this allocator via `allocate_internal` or `realloc`.
             // `recover_alloc_info` guarantees this if `user_ptr` was valid.
             ALLOCATOR.lock().free(start_ptr, original_layout);
         }
         Err(_) => {
-            // Indicates an internal logic error (layout recovery failed) or memory corruption
-            // (metadata damaged or ptr wasn't from this allocator).
-            // In a real system, log an error or trigger an assertion. Avoid crashing.
-            // Leaking memory might be the safest option here if corruption is suspected.
-            #[cfg(feature = "panic_invalid_free")]
-            panic!("Memory corruption detected or invalid pointer passed to free.");
+            // Could not recover allocation info - indicates corruption or invalid pointer.
+            // Report error but do not attempt to free.
+            report_error(HeapError::InvalidFree, ptr);
         }
     }
 }
@@ -314,49 +373,52 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
     // --- Attempt Optimized Realloc ---
 
     // 1. Recover original allocation info (pointer returned by talc and its layout).
-    let (old_ptr, old_layout) = match recover_alloc_info(user_ptr) {
+    let (old_ptr, old_layout, old_metadata) = match recover_alloc_info(user_ptr) {
         Ok(res) => res,
-        Err(_) => return ptr::null_mut(), // Cannot recover layout - indicates corruption or invalid ptr.
+        Err(_) => {
+            report_error(HeapError::InvalidFree, ptr);
+            return ptr::null_mut();
+        }
     };
 
-    // 2. Read old metadata *again* to get the original alignment and user size.
-    // Safety: Assumes ptr is valid and metadata readable.
-    let old_metadata = get_metadata_ptr(user_ptr).as_ptr().read();
+    // 2. Extract original alignment from metadata.
     let alignment = old_metadata.alignment;
 
     // 3. Compare sizes and choose strategy.
     match size.cmp(&old_metadata.size) {
-        Ordering::Equal => {
+        core::cmp::Ordering::Equal => {
             // Sizes are the same, no operation needed.
             ptr
         }
 
-        Ordering::Less => {
+        core::cmp::Ordering::Less => {
             // --- Shrink ---
             // Calculate the new total layout for the smaller size.
-            let (new_total_layout, _new_user_data_offset) =
-                match layout_for_allocation(size, alignment) {
-                    Ok(l) => l,
-                    Err(_) => return ptr::null_mut(), // Should not fail for smaller size if old layout was valid.
-                };
-            let new_total_size = new_total_layout.size();
+            let (new_total_layout, _) = match layout_for_allocation(size, alignment) {
+                Ok(l) => l,
+                Err(_) => return ptr::null_mut(),
+            };
 
             // Attempt to shrink in place.
-            let mut allocator_lock = ALLOCATOR.lock();
+            ALLOCATOR
+                .lock()
+                .shrink(old_ptr, old_layout, new_total_layout.size());
 
-            // Safety: `old_ptr` and `old_layout` are valid.
-            allocator_lock.shrink(old_ptr, old_layout, new_total_size);
-            drop(allocator_lock); // Release lock
+            // Successfully shrunk in place (or no-op if already small enough).
+            let metadata_ptr = user_ptr.as_ptr().sub(METADATA_SIZE).cast::<Metadata>();
 
-            let metadata_ptr = get_metadata_ptr(user_ptr);
-            // Safety: metadata_ptr is valid.
-            metadata_ptr.as_ptr().write(Metadata { size, alignment });
+            // Safety: metadata_ptr is valid and points to the correct location.
+            metadata_ptr.write(Metadata {
+                canary: CANARY_VALUE,
+                size,
+                alignment,
+            });
 
             // Return original pointer
             ptr
         }
 
-        Ordering::Greater => {
+        core::cmp::Ordering::Greater => {
             // Calculate the required new total layout based on new user size and original alignment.
             let (new_total_layout, _) = match layout_for_allocation(size, alignment) {
                 Ok(l) => l,
@@ -375,9 +437,15 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
                     // We MUST update the metadata *in place*.
                     drop(allocator_lock); // Release lock before writing metadata
 
-                    let metadata_ptr = get_metadata_ptr(user_ptr);
+                    // Update metadata with new size.
+                    let metadata_ptr = user_ptr.as_ptr().sub(METADATA_SIZE).cast::<Metadata>();
+
                     // Safety: metadata_ptr is valid as pointer hasn't moved.
-                    metadata_ptr.as_ptr().write(Metadata { size, alignment });
+                    metadata_ptr.write(Metadata {
+                        canary: CANARY_VALUE, // <-- THE FIX
+                        size,
+                        alignment,
+                    });
 
                     // Return the original user pointer.
                     ptr
