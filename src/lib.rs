@@ -189,12 +189,8 @@ pub unsafe extern "C" fn heap_init(address: *mut u8, size: usize) -> bool {
 /// # Safety
 /// - The `handler` function pointer must be valid and callable.
 #[no_mangle]
-pub unsafe extern "C" fn heap_onerror(handler: Option<ErrorHandler>) {
-    let ptr = match handler {
-        Some(h) => h as *mut c_void,
-        None => ptr::null_mut(),
-    };
-    ERROR_HANDLER.store(ptr, Ordering::SeqCst);
+pub unsafe extern "C" fn heap_onerror(handler: ErrorHandler) {
+    ERROR_HANDLER.store(handler as *mut c_void, Ordering::SeqCst);
 }
 
 /// Returns the usable size of the memory block pointed to by `ptr`.
