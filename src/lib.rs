@@ -100,7 +100,7 @@ fn layout_for_allocation(
 /// This function is unsafe because it involves calling a raw function pointer.
 #[inline]
 unsafe fn report_error(error: HeapError, ptr: *mut c_void) {
-    let handler_ptr = ERROR_HANDLER.load(Ordering::Relaxed);
+    let handler_ptr = ERROR_HANDLER.load(Ordering::SeqCst);
     if !handler_ptr.is_null() {
         let handler: ErrorHandler = core::mem::transmute(handler_ptr);
         handler(error, ptr);
@@ -299,7 +299,7 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_
     }
 
     // Check size validity (non-zero, multiple of alignment - C standard requirement).
-    if size == 0 || size % alignment != 0 {
+    if size == 0 || !size.is_multiple_of(alignment) {
         // Consider setting errno to EINVAL.
         return ptr::null_mut();
     }
