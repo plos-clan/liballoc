@@ -281,6 +281,35 @@ pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
     allocate_internal(size, align_of::<usize>())
 }
 
+/// Allocates memory for an array of `nmemb` elements of `size` bytes each
+/// and initializes all bytes in the allocated storage to zero.
+///
+/// # Safety
+/// Caller is responsible for handling the returned pointer and freeing it.
+/// Returns NULL on integer overflow or allocation failure.
+#[no_mangle]
+pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut c_void {
+    // This is a critical security check. If nmemb * size overflows usize,
+    // we must return null to prevent allocating a small buffer for a large request.
+    let total_size = match nmemb.checked_mul(size) {
+        Some(s) => s,
+        None => return ptr::null_mut(),
+    };
+
+    // Allocate using the internal allocator with default alignment.
+    // Calloc typically uses the same alignment as malloc (align_of::<usize>).
+    let ptr = allocate_internal(total_size, align_of::<usize>());
+
+    // Zero-initialize the memory if allocation succeeded.
+    if !ptr.is_null() {
+        // ptr::write_bytes is Rust's equivalent of C's memset(ptr, 0, len).
+        // It is highly optimized (usually compiles to efficient SIMD instructions).
+        ptr::write_bytes(ptr.cast::<u8>(), 0, total_size);
+    }
+
+    ptr
+}
+
 /// Allocates memory with specified alignment.
 /// Stores metadata (size, alignment) before the returned pointer.
 ///
