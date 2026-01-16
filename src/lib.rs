@@ -7,7 +7,7 @@ use core::ffi::c_void;
 use core::mem::{align_of, size_of};
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use talc::{ClaimOnOom, Span, Talc, Talck};
 
 // Yes if panic just loops forever and you know died.
@@ -31,20 +31,48 @@ pub type ErrorHandler = unsafe extern "C" fn(error: HeapError, ptr: *mut c_void)
 // Use AtomicPtr for safe, lock-free access (even if we only set it once).
 static ERROR_HANDLER: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
-// A constant canary value to verify metadata integrity.
-const CANARY_VALUE: usize = 0xDEC0DED;
+// A constant checksum value to verify metadata integrity.
+static CHECKSUM_SALT: AtomicUsize = AtomicUsize::new(0x5A17_C0DE);
 
 /// Metadata struct stored *before* the user pointer's aligned position.
 /// We store the requested size and the alignment used for the user pointer.
 #[repr(C)] // Ensure predictable layout for size/alignment calculations
 #[derive(Debug, Clone, Copy)]
 struct Metadata {
-    /// A canary value to help detect memory corruption.
-    canary: usize,
+    /// A checksum derived from size, alignment, and a salt.
+    checksum: usize,
     /// The size requested by the user for the allocation.
     size: usize,
     /// The alignment requested by the user (or default for malloc).
     alignment: usize,
+}
+
+// Calculates a simple checksum for metadata integrity verification.
+///
+/// This function mixes the allocation size, alignment, and a global salt to produce
+/// a verification value.
+///
+/// # Algorithm
+/// It uses a lightweight mixing step (similar to MurmurHash3's finalizer) to ensure
+/// that small bit changes in size/alignment result in large changes in the checksum.
+///
+/// # Stale Pointer Protection
+/// The inclusion of `CHECKSUM_SALT` (which rotates on `heap_init`) ensures that
+/// pointers from a previous heap generation cannot be successfully freed or reallocated
+/// after the allocator has been reset, preventing use-after-reset UB.
+#[inline(always)]
+fn calculate_checksum(size: usize, alignment: usize) -> usize {
+    let mut x = size;
+    // Mix in the alignment and the global salt.
+    // The salt changes every time the heap is re-initialized.
+    x ^= alignment;
+    x ^= CHECKSUM_SALT.load(Ordering::Relaxed);
+
+    // Apply a fast avalanche function to spread the bits.
+    // This helps detect partial corruption or linear overflows.
+    x = (x ^ (x >> 15)).wrapping_mul(0xd168aaad);
+    x ^= x >> 15;
+    x
 }
 
 // Use a spinlock mutex for thread safety in concurrent environments (if applicable)
@@ -121,8 +149,11 @@ unsafe fn get_metadata_ptr(user_ptr: NonNull<u8>) -> Result<NonNull<Metadata>, (
     let metadata_ptr = user_ptr.as_ptr().sub(METADATA_SIZE);
     let metadata = &*(metadata_ptr.cast::<Metadata>());
 
-    // Check the canary to verify integrity.
-    if metadata.canary != CANARY_VALUE {
+    // Verify the checksum to ensure metadata integrity.
+    let expected = calculate_checksum(metadata.size, metadata.alignment);
+
+    // Check the checksum to verify integrity.
+    if metadata.checksum != expected {
         Err(())
     } else {
         Ok(NonNull::new_unchecked(metadata_ptr.cast::<Metadata>()))
@@ -168,15 +199,12 @@ unsafe fn recover_alloc_info(user_ptr: NonNull<u8>) -> Result<(NonNull<u8>, Layo
 #[no_mangle]
 pub unsafe extern "C" fn heap_init(address: *mut u8, size: usize) -> bool {
     // Basic sanity checks
-    if address.is_null() || size < METADATA_SIZE * 8 {
+    if address.is_null() || size < METADATA_SIZE * 2 {
         return false;
     }
 
-    // Ensure size is somewhat reasonable. Talc itself has minimal overhead.
-    // We need enough space for at least one metadata block and minimal user data.
-    if size < METADATA_SIZE * 2 {
-        return false;
-    }
+    // Update checksum salt to help catch stale metadata across resets.
+    CHECKSUM_SALT.fetch_add(1, Ordering::SeqCst);
 
     // Lock the allocator
     let mut allocator_guard = ALLOCATOR.lock();
@@ -288,7 +316,7 @@ unsafe fn allocate_internal(size: usize, alignment: usize) -> *mut c_void {
             // Write the metadata (original requested size and alignment).
             // Safety: metadata_ptr points to valid, allocated space of METADATA_SIZE within the block.
             metadata_ptr.write(Metadata {
-                canary: CANARY_VALUE,
+                checksum: calculate_checksum(size, alignment),
                 size,
                 alignment,
             });
@@ -332,6 +360,11 @@ pub unsafe extern "C" fn calloc(nmemb: usize, size: usize) -> *mut c_void {
         Some(s) => s,
         None => return ptr::null_mut(),
     };
+
+    // Check for zero-sized allocation.
+    if total_size == 0 {
+        return ptr::null_mut();
+    }
 
     // Allocate using the internal allocator with default alignment.
     // Calloc typically uses the same alignment as malloc (align_of::<usize>).
@@ -391,10 +424,10 @@ pub unsafe extern "C" fn free(ptr: *mut c_void) {
     // Recover the original allocation pointer and layout using the metadata stored before user_ptr.
     match recover_alloc_info(user_ptr) {
         Ok((start_ptr, original_layout, _)) => {
-            // Before freeing, corrupt the canary to help catch use-after-free
+            // Before freeing, corrupt the checksum to help catch use-after-free
             // if the user tries to free it again.
             if let Ok(metadata_ptr) = get_metadata_ptr(user_ptr) {
-                (*metadata_ptr.as_ptr()).canary = 0; // Set to a non-canary value
+                (*metadata_ptr.as_ptr()).checksum = 0; // Set to a non-checksum value
             }
 
             // Safety: `start_ptr` and `original_layout` must correspond to a previous
@@ -423,7 +456,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
     // Handle null pointer: standard requires this is equivalent to malloc(size).
     let Some(user_ptr) = NonNull::new(ptr.cast::<u8>()) else {
         // Use default alignment consistent with malloc.
-        return allocate_internal(size, align_of::<usize>());
+        return malloc(size);
     };
 
     // Handle size == 0: standard requires this is equivalent to free(ptr) and returns null.
@@ -454,7 +487,6 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
         }
 
         core::cmp::Ordering::Less => {
-            // --- Shrink ---
             // Calculate the new total layout for the smaller size.
             let (new_total_layout, _) = match layout_for_allocation(size, alignment) {
                 Ok(l) => l,
@@ -471,7 +503,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
 
             // Safety: metadata_ptr is valid and points to the correct location.
             metadata_ptr.write(Metadata {
-                canary: CANARY_VALUE,
+                checksum: calculate_checksum(size, alignment),
                 size,
                 alignment,
             });
@@ -504,7 +536,7 @@ pub unsafe extern "C" fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void {
 
                     // Safety: metadata_ptr is valid as pointer hasn't moved.
                     metadata_ptr.write(Metadata {
-                        canary: CANARY_VALUE, // <-- THE FIX
+                        checksum: calculate_checksum(size, alignment),
                         size,
                         alignment,
                     });
