@@ -158,28 +158,65 @@ unsafe fn recover_alloc_info(user_ptr: NonNull<u8>) -> Result<(NonNull<u8>, Layo
 
 // == C API Implementation ==
 
-/// Initializes the heap memory arena.
+/// Initializes (or RESETS) the heap memory arena.
 ///
-/// # Safety
-/// - `address` must be a valid pointer to the start of a memory block.
-/// - `size` must be the correct size of that memory block.
-/// - This function should only be called once.
-/// - The memory block should ideally be aligned to at least `align_of::<Metadata>()`.
+/// # Warning
+/// Calling this function a second time will **wipe** the allocator state.
+/// Any pointers allocated before the reset will become "leaked" (safe to use,
+/// but calling free() on them later is Undefined Behavior/Double Free because
+/// the new allocator doesn't know about them).
 #[no_mangle]
 pub unsafe extern "C" fn heap_init(address: *mut u8, size: usize) -> bool {
-    // Ensure the address is not null.
-    if address.is_null() {
+    // Basic sanity checks
+    if address.is_null() || size < METADATA_SIZE * 8 {
         return false;
     }
-    // Basic check: Ensure size is somewhat reasonable. Talc itself has minimal overhead.
+
+    // Ensure size is somewhat reasonable. Talc itself has minimal overhead.
     // We need enough space for at least one metadata block and minimal user data.
     if size < METADATA_SIZE * 2 {
-        // Arbitrary minimal check
-        return false; // Arena too small.
+        return false;
     }
+
+    // Lock the allocator
+    let mut allocator_guard = ALLOCATOR.lock();
+
+    // Overwrite the existing Talc instance with a fresh one.
+    // We construct a new Talc exactly how the static one was initialized.
+    // This effectively "forgets" all previous spans and allocations.
+    *allocator_guard = Talc::new(unsafe { ClaimOnOom::new(Span::empty()) });
 
     // Give the memory span to the allocator.
     let arena = Span::from_base_size(address, size);
+    allocator_guard.claim(arena).is_ok()
+}
+
+/// Extends the heap with a new memory block.
+///
+/// # Safety
+/// - `address` must be a valid pointer to the start of a new, available memory block.
+/// - `size` must be the correct size of that memory block.
+/// - The memory block must not overlap with currently managed memory (unless extending the end).
+/// - Thread safety is handled internally by the allocator lock.
+#[no_mangle]
+pub unsafe extern "C" fn heap_extend(address: *mut u8, size: usize) -> bool {
+    // Basic sanity checks
+    if address.is_null() || size == 0 {
+        return false;
+    }
+
+    // Minimal size check similar to heap_init to avoid useless fragmentation
+    // imply that the block is at least big enough for some headers.
+    if size < METADATA_SIZE {
+        return false;
+    }
+
+    // Create the span for the new memory
+    let arena = Span::from_base_size(address, size);
+
+    // Lock the allocator and claim the new memory.
+    // Talc handles multiple spans automatically. If 'address' is immediately
+    // following an existing heap chunk, Talc will merge them.
     ALLOCATOR.lock().claim(arena).is_ok()
 }
 
