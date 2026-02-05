@@ -26,6 +26,8 @@ jobs:
         cargo build --release
         mv target/x86_64-unknown-none/release/liballoc.a liballoc-x86_64.a
         mv target/i686-unknown-none/release/liballoc.a liballoc-i686.a
+        mv target/aarch64-unknown-none-softfloat/release/liballoc.a liballoc-aarch64.a
+        mv target/loongarch64-unknown-none-softfloat/release/liballoc.a liballoc-loongarch64.a
 
     - name: Generate header
       run: cbindgen --output alloc.h
@@ -36,6 +38,8 @@ jobs:
         name: Nightly build
         tag_name: release
         files: |
-          liballoc-i686.a
           liballoc-x86_64.a
+          liballoc-i686.a
+          liballoc-aarch64.a
+          liballoc-loongarch64.a
           alloc.h
