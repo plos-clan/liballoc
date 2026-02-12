@@ -8,13 +8,27 @@ use core::mem::{align_of, size_of};
 use core::panic::PanicInfo;
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
-use talc::{ClaimOnOom, Span, Talc, Talck};
+use talc::{OomHandler, Span, Talc, Talck};
 
 // Yes if panic just loops forever and you know died.
 #[panic_handler]
 unsafe fn panic(_info: &PanicInfo) -> ! {
     loop {}
 }
+
+// Represents a raw memory span returned by the external OOM callback.
+#[repr(C)]
+pub struct MemorySpan {
+    /// Pointer to the start of the new memory block.
+    /// Must be non-null and properly aligned if the system requires it.
+    ptr: *mut u8,
+    /// The size of the memory block in bytes.
+    /// If `size` is 0, the allocator considers the OOM handling failed.
+    size: usize,
+}
+
+// Function pointer type for the OOM callback.
+type OomCallback = unsafe extern "C" fn(usize) -> MemorySpan;
 
 // Define a type for our error handling function pointer.
 // It will receive an enum indicating the error type and the invalid pointer.
@@ -26,6 +40,9 @@ pub enum HeapError {
 
 /// Type alias for the error handler function pointer.
 pub type ErrorHandler = unsafe extern "C" fn(error: HeapError, ptr: *mut c_void);
+
+// Holds the user-provided OOM callback.
+static OOM_CALLBACK: AtomicPtr<c_void> = AtomicPtr::new(ptr::null_mut());
 
 // A static variable to hold the user-provided error handler.
 // Use AtomicPtr for safe, lock-free access (even if we only set it once).
@@ -76,12 +93,33 @@ fn calculate_checksum(size: usize, alignment: usize) -> usize {
 }
 
 // Use a spinlock mutex for thread safety in concurrent environments (if applicable)
-static ALLOCATOR: Talck<spin::Mutex<()>, ClaimOnOom> =
-    Talc::new(unsafe { ClaimOnOom::new(Span::empty()) }).lock();
+static ALLOCATOR: Talck<spin::Mutex<()>, OomHandlerImpl> = Talc::new(OomHandlerImpl).lock();
 
 // Size and alignment of the metadata header itself.
 const METADATA_SIZE: usize = size_of::<Metadata>();
 const METADATA_ALIGN: usize = align_of::<Metadata>();
+
+struct OomHandlerImpl;
+
+impl OomHandler for OomHandlerImpl {
+    fn handle_oom(talc: &mut Talc<Self>, layout: Layout) -> Result<(), ()> {
+        let callback_ptr = OOM_CALLBACK.load(Ordering::SeqCst);
+
+        if callback_ptr.is_null() {
+            return Err(());
+        }
+
+        let callback: OomCallback = unsafe { core::mem::transmute(callback_ptr) };
+        let ffi_span = unsafe { callback(layout.size()) };
+        let new_span = Span::from_base_size(ffi_span.ptr, ffi_span.size);
+
+        if new_span.is_empty() {
+            return Err(());
+        }
+
+        unsafe { talc.claim(new_span).map(|_| ()) }
+    }
+}
 
 /// Calculates the layout required for the underlying allocation from `talc`.
 /// This layout must be large enough to hold the Metadata struct plus the requested
@@ -196,6 +234,13 @@ unsafe fn recover_alloc_info(user_ptr: NonNull<u8>) -> Result<(NonNull<u8>, Layo
 /// Any pointers allocated before the reset will become "leaked" (safe to use,
 /// but calling free() on them later is Undefined Behavior/Double Free because
 /// the new allocator doesn't know about them).
+///
+/// # Safety
+/// - `address` must be a valid pointer to the start of a contiguous, writable memory block.
+/// - `size` must be the correct size of that memory block in bytes.
+/// - The memory range `[address, address + size)` must be exclusively available to the allocator
+///   (it must not be accessed or modified by other code while managed by the allocator).
+/// - Thread safety is handled internally by the allocator lock.
 #[no_mangle]
 pub unsafe extern "C" fn heap_init(address: *mut u8, size: usize) -> bool {
     // Basic sanity checks
@@ -212,7 +257,7 @@ pub unsafe extern "C" fn heap_init(address: *mut u8, size: usize) -> bool {
     // Overwrite the existing Talc instance with a fresh one.
     // We construct a new Talc exactly how the static one was initialized.
     // This effectively "forgets" all previous spans and allocations.
-    *allocator_guard = Talc::new(unsafe { ClaimOnOom::new(Span::empty()) });
+    *allocator_guard = Talc::new(OomHandlerImpl);
 
     // Give the memory span to the allocator.
     let arena = Span::from_base_size(address, size);
@@ -256,6 +301,26 @@ pub unsafe extern "C" fn heap_extend(address: *mut u8, size: usize) -> bool {
 #[no_mangle]
 pub unsafe extern "C" fn heap_onerror(handler: ErrorHandler) {
     ERROR_HANDLER.store(handler as *mut c_void, Ordering::SeqCst);
+}
+
+/// Registers a custom Out-Of-Memory (OOM) handler.
+///
+/// # Purpose
+/// This handler acts as a hook that is triggered when the allocator **runs out of memory**.
+/// It provides a mechanism to **automatically extend the heap** on demand.
+///
+/// Instead of immediately returning `NULL` when the heap is full, the allocator will:
+/// 1. Call this function.
+/// 2. If this function returns a valid new memory span, the allocator adds it to the heap.
+/// 3. The allocator retries the original allocation request.
+///
+/// # Safety
+/// - The `callback` function pointer must be valid and callable.
+/// - The callback implementation must ensure the returned memory is valid and not already in use.
+/// - The callback itself must be thread-safe if the allocator is accessed concurrently.
+#[no_mangle]
+pub unsafe extern "C" fn heap_set_oom_handler(callback: OomCallback) {
+    OOM_CALLBACK.store(callback as *mut c_void, Ordering::SeqCst);
 }
 
 /// Returns the usable size of the memory block pointed to by `ptr`.
