@@ -5,7 +5,7 @@ permissions:
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
     paths-ignore:
       - 'README.md'
       - '.gitignore'
@@ -23,7 +23,7 @@ jobs:
       with:
         crate: cbindgen
 
-    - name: Build general release
+    - name: Build release
       run: |
         cargo build --release
         mv target/x86_64-unknown-none/release/liballoc.a liballoc-x86_64.a
@@ -41,9 +41,5 @@ jobs:
         name: Nightly build
         tag_name: release
         files: |
-          liballoc-x86_64.a
-          liballoc-i686.a
-          liballoc-aarch64.a
-          liballoc-riscv64.a
-          liballoc-loongarch64.a
+          liballoc-*.a
           alloc.h

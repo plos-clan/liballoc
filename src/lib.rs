@@ -472,6 +472,64 @@ pub unsafe extern "C" fn aligned_alloc(alignment: usize, size: usize) -> *mut c_
     allocate_internal(size, alignment)
 }
 
+/// Allocates memory with a specified alignment, conforming to the POSIX standard.
+/// The allocated memory address is placed in the location pointed to by `memptr`.
+///
+/// # POSIX Requirements
+/// - `alignment` must be a power of two.
+/// - `alignment` must be a multiple of `sizeof(void *)` (which is `size_of::<*mut c_void>()`).
+/// - Unlike C11 `aligned_alloc`, `size` is **not** required to be a multiple of `alignment`.
+///
+/// # Safety
+/// - `memptr` must be a valid, non-null, writable pointer to a `*mut c_void`.
+/// - Caller is responsible for eventually freeing the returned `*memptr` via `free`.
+#[no_mangle]
+pub unsafe extern "C" fn posix_memalign(
+    memptr: *mut *mut c_void,
+    alignment: usize,
+    size: usize,
+) -> i32 {
+    // Standard POSIX error codes.
+    const EINVAL: i32 = 22;
+    const ENOMEM: i32 = 12;
+
+    // Defend against null pointer dereference for the return parameter.
+    if memptr.is_null() {
+        return EINVAL;
+    }
+
+    // Check alignment validity: must be a power of two AND a multiple of void* size.
+    let void_ptr_size = size_of::<*mut c_void>();
+    if !alignment.is_power_of_two() || !alignment.is_multiple_of(void_ptr_size) {
+        return EINVAL;
+    }
+
+    if size == 0 {
+        // POSIX specification for size == 0:
+        // The value placed in *memptr is either a null pointer or a unique pointer
+        // that can be successfully passed to free().
+        // We choose to write NULL and return success, which is efficient and aligns
+        // with our malloc(0) implementation strategy.
+        *memptr = ptr::null_mut();
+        return 0;
+    }
+
+    // Delegate to the internal allocation function.
+    // `allocate_internal` safely calculates the exact layout and writes the metadata.
+    let ptr = allocate_internal(size, alignment);
+
+    if ptr.is_null() {
+        // Layout calculation overflowed or Out-Of-Memory (OOM).
+        return ENOMEM;
+    }
+
+    // Allocation succeeded. Write the aligned user pointer to the output argument.
+    *memptr = ptr;
+
+    // Return 0 to indicate success.
+    0
+}
+
 /// Frees memory previously allocated by `malloc`, `realloc`, or `aligned_alloc`.
 ///
 /// # Safety
